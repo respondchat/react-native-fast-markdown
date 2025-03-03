@@ -1,5 +1,7 @@
 use std::fs;
 
+use pulldown_cmark::{Event, Parser};
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
@@ -10,16 +12,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start = std::time::Instant::now();
 
-    for _ in 0..1000 {
-        // let node = markdown::to_mdast(&file, &markdown::ParseOptions::default());
+    eprintln!("[");
+    let mut width = 0;
+    for event in Parser::new(&file) {
+        if let Event::End(_) = event {
+            width -= 2;
+        }
 
-        let parser = pulldown_cmark::Parser::new(&file);
-
-        let mut html_output = String::new();
-        pulldown_cmark::html::push_html(&mut html_output, parser);
-
-        println!("{}", html_output.len());
+        eprintln!("  {:width$}{event:?}", "");
+        if let Event::Start(_) = event {
+            width += 2;
+        }
     }
+    eprintln!("]");
 
     println!("Time: {:?}", start.elapsed());
 
