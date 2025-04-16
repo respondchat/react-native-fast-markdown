@@ -18,16 +18,25 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+#[cfg(target_os = "android")]
+mod android;
+
+#[cfg(target_os = "ios")]
+mod ios;
+
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
-static mut SEGMENT_CACHE: MaybeUninit<HashMap<TextSegment, JsiValue<'static>>> =
-    MaybeUninit::uninit();
+static mut STYLE_CACHE: MaybeUninit<HashMap<TextStyle, JsiValue<'static>>> = MaybeUninit::uninit();
 
 static mut STRING_CACHE: MaybeUninit<HashMap<String, JsiValue<'static>>> = MaybeUninit::uninit();
 static mut PROP_NAME_CACHE: MaybeUninit<HashMap<String, PropName<'static>>> = MaybeUninit::uninit();
+static mut COLOR_CACHE: MaybeUninit<HashMap<[u8; 4], JsiValue<'static>>> = MaybeUninit::uninit();
 static mut FONT_STYLE_CACHE: MaybeUninit<HashMap<FontStyle, JsiValue<'static>>> =
     MaybeUninit::uninit();
+static mut FONT_FAMILIES_CACHE: MaybeUninit<HashMap<Vec<Cow<'static, str>>, JsiValue<'static>>> =
+    MaybeUninit::uninit();
+static mut F32_CONSTRUCTOR: MaybeUninit<JsiFn<'static>> = MaybeUninit::uninit();
 
 static mut LINKIFY: MaybeUninit<LinkFinder> = MaybeUninit::uninit();
 
@@ -68,6 +77,14 @@ pub enum FontSlant {
     Oblique,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TextDecoration {
+    NoDecoration = 0,
+    Underline = 1,
+    Overline = 2,
+    LineThrough = 4,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FontStyle {
     weight: FontWeight,
@@ -81,11 +98,11 @@ pub struct TextStyle {
 
     font_style: Option<FontStyle>,
 
-    decoration: Option<Cow<'static, str>>,
+    decoration: Option<TextDecoration>,
 
-    font_families: Option<Cow<'static, str>>,
+    font_families: Option<Vec<Cow<'static, str>>>,
 
-    color: Option<Cow<'static, str>>,
+    color: Option<[u8; 4]>,
 }
 
 impl Default for TextStyle {
@@ -151,6 +168,11 @@ pub struct MarkdownOptions {
     h5_font_size: f64,
     h6_font_size: f64,
     base_font_size: f64,
+    link_color: [u8; 4],
+    height_multiplier: f64,
+    font_families: Option<Vec<Cow<'static, str>>>,
+    code_block_font_family: Cow<'static, str>,
+    theme: Cow<'static, str>,
 }
 
 impl Default for MarkdownOptions {
@@ -163,6 +185,11 @@ impl Default for MarkdownOptions {
             h5_font_size: 18.0,
             h6_font_size: 15.3,
             base_font_size: 18.0,
+            link_color: [0, 122, 255, 255],
+            height_multiplier: 1.0,
+            font_families: None,
+            code_block_font_family: Cow::Borrowed("monospace"),
+            theme: Cow::Borrowed("base16-ocean.dark"),
         }
     }
 }
@@ -184,6 +211,11 @@ impl<'a> FromValue<'a> for MarkdownOptions {
         let mut h4_font_size = 23.4;
         let mut h5_font_size = 18.0;
         let mut h6_font_size = 15.3;
+        let mut link_color: [u8; 4] = [0, 122, 255, 255];
+        let mut height_multiplier = 1.0;
+        let mut font_families = None;
+        let mut code_block_font_family = Cow::from("monospace");
+        let mut theme = Cow::from("base16-ocean.dark");
 
         if value.is_object() {
             let obj = JsiObject::from_value(&value, rt)?;
@@ -221,6 +253,55 @@ impl<'a> FromValue<'a> for MarkdownOptions {
             if let Ok(val) = get_number(obj.get(get_prop_name(rt, "h6_font_size"), rt), rt) {
                 h6_font_size = val;
             }
+
+            let link_color_prop = obj.get(get_prop_name(rt, "link_color"), rt);
+
+            if link_color_prop.is_object() {
+                let arr = JsiArray::from_value(&link_color_prop, rt).unwrap();
+                let obj = JsiObject::from_value(&link_color_prop, rt).unwrap();
+
+                if arr.len(rt) != 4 {
+                    return None;
+                }
+
+                for i in 0..arr.len(rt) {
+                    let val = get_number(obj.get(get_prop_name(rt, &i.to_string()), rt), rt)
+                        .unwrap_or(0.0);
+                    link_color[i] = val as u8;
+                }
+            }
+
+            if let Ok(val) = get_number(obj.get(get_prop_name(rt, "height_multiplier"), rt), rt) {
+                height_multiplier = val;
+            }
+
+            let val = obj.get(get_prop_name(rt, "font_families"), rt);
+
+            if val.is_object() {
+                let arr = JsiArray::from_value(&val, rt).unwrap();
+                let obj = JsiObject::from_value(&val, rt).unwrap();
+
+                let mut families = Vec::new();
+                for i in 0..arr.len(rt) {
+                    let family =
+                        String::from_value(&obj.get(get_prop_name(rt, &i.to_string()), rt), rt)
+                            .unwrap();
+                    families.push(Cow::Owned(family));
+                }
+                font_families = Some(families);
+            }
+
+            let code_block_font_family_prop =
+                obj.get(get_prop_name(rt, "code_block_font_family"), rt);
+            if code_block_font_family_prop.is_string() {
+                code_block_font_family =
+                    String::from_value(&code_block_font_family_prop, rt)?.into();
+            }
+
+            let theme_prop = obj.get(get_prop_name(rt, "theme"), rt);
+            if theme_prop.is_string() {
+                theme = String::from_value(&theme_prop, rt)?.into();
+            }
         }
 
         Some(Self {
@@ -231,6 +312,11 @@ impl<'a> FromValue<'a> for MarkdownOptions {
             h4_font_size,
             h5_font_size,
             h6_font_size,
+            link_color,
+            height_multiplier,
+            font_families,
+            code_block_font_family,
+            theme,
         })
     }
 }
@@ -238,8 +324,7 @@ impl<'a> FromValue<'a> for MarkdownOptions {
 #[cfg(test)]
 mod test;
 
-#[no_mangle]
-pub extern "C" fn Markdown_init(rt: *mut jsi::sys::Runtime) {
+pub fn init(rt: *mut jsi::sys::Runtime) {
     let mut rt = RuntimeHandle::new_unchecked(rt);
 
     let mut global = rt.global();
@@ -279,15 +364,26 @@ pub extern "C" fn Markdown_init(rt: *mut jsi::sys::Runtime) {
     );
 
     unsafe {
-        SEGMENT_CACHE.as_mut_ptr().write(HashMap::new());
+        STYLE_CACHE.as_mut_ptr().write(HashMap::new());
         STRING_CACHE.as_mut_ptr().write(HashMap::new());
         PROP_NAME_CACHE.as_mut_ptr().write(HashMap::new());
+        COLOR_CACHE.as_mut_ptr().write(HashMap::new());
         FONT_STYLE_CACHE.as_mut_ptr().write(HashMap::new());
+        FONT_FAMILIES_CACHE.as_mut_ptr().write(HashMap::new());
         let mut linkify = LinkFinder::new();
         linkify.url_can_be_iri(false);
         linkify.url_must_have_scheme(true);
         linkify.kinds(&[linkify::LinkKind::Url]);
         LINKIFY.as_mut_ptr().write(linkify);
+
+        let f32 = JsiFn::from_value(
+            &global.get(PropName::new("Float32Array", &mut rt), &mut rt),
+            &mut rt,
+        );
+
+        if let Some(f32) = f32 {
+            F32_CONSTRUCTOR.as_mut_ptr().write(f32);
+        }
     }
 }
 
@@ -316,6 +412,7 @@ pub fn parse_markdown(markdown_input: &str, opts: &MarkdownOptions) -> Vec<TextS
     }
 
     new_markdown_input.push_str(&markdown_input[last_pos..]);
+    let new_markdown_input = new_markdown_input.replace('\n', "\\\n");
 
     let parser = Parser::new_ext(new_markdown_input.as_str(), options);
 
@@ -330,10 +427,12 @@ pub fn parse_markdown(markdown_input: &str, opts: &MarkdownOptions) -> Vec<TextS
     for event in parser {
         match event {
             Event::Start(tag) => {
-                let mut new_style = current_styles
-                    .last()
-                    .cloned()
-                    .unwrap_or(TextStyle::default_with_size(opts.base_font_size));
+                let mut new_style = current_styles.last().cloned().unwrap_or_else(|| {
+                    let mut style = TextStyle::default_with_size(opts.base_font_size);
+                    style.font_families = opts.font_families.clone();
+
+                    style
+                });
                 match tag {
                     Tag::Strong => {
                         if new_style.font_style.is_none() {
@@ -348,7 +447,7 @@ pub fn parse_markdown(markdown_input: &str, opts: &MarkdownOptions) -> Vec<TextS
                         new_style.font_style.as_mut().unwrap().slant = FontSlant::Italic;
                     }
                     Tag::Strikethrough => {
-                        new_style.decoration = Some(Cow::Borrowed("line-through"))
+                        new_style.decoration = Some(TextDecoration::LineThrough);
                     }
                     Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang)) => {
                         in_code_block = true;
@@ -370,7 +469,8 @@ pub fn parse_markdown(markdown_input: &str, opts: &MarkdownOptions) -> Vec<TextS
                     }
                     Tag::Link { dest_url, .. } => {
                         link_href = Some(dest_url.to_string());
-                        new_style.decoration = Some(Cow::Borrowed("underline"));
+                        new_style.decoration = Some(TextDecoration::Underline);
+                        new_style.color = Some(opts.link_color.clone());
                     }
                     _ => {}
                 }
@@ -387,6 +487,9 @@ pub fn parse_markdown(markdown_input: &str, opts: &MarkdownOptions) -> Vec<TextS
                         code_lang = None;
                     }
                     TagEnd::Link { .. } => link_href = None,
+                    TagEnd::Paragraph => {
+                        pending_breaks.push_str("\n\n");
+                    }
                     _ => {}
                 }
                 current_styles.pop();
@@ -425,7 +528,12 @@ fn highlight_code_block(
     language: Option<&str>,
     opts: &MarkdownOptions,
 ) -> Vec<TextSegment> {
-    let theme = &THEME_SET.themes["base16-ocean.dark"];
+    let theme = &THEME_SET.themes.get(opts.theme.as_ref());
+
+    if theme.is_none() {
+        return Vec::new();
+    }
+    let theme = theme.unwrap();
 
     let syntax = language
         .as_deref()
@@ -439,14 +547,16 @@ fn highlight_code_block(
     for line in LinesWithEndings::from(code) {
         if let Ok(ranges) = highlighter.highlight_line(line, &SYNTAX_SET) {
             for (style, text) in ranges {
-                let color = format!(
-                    "#{:02X}{:02X}{:02X}",
-                    style.foreground.r, style.foreground.g, style.foreground.b
-                );
+                let color = [
+                    style.foreground.r,
+                    style.foreground.g,
+                    style.foreground.b,
+                    255,
+                ];
 
                 let text_style = TextStyle {
                     font_size: Some(unsafe { NotNan::new_unchecked(opts.base_font_size) }),
-                    font_families: Some(Cow::Borrowed("monospace")),
+                    font_families: Some(vec![opts.code_block_font_family.clone()]),
                     color: Some(color.into()),
                     ..Default::default()
                 };
@@ -489,6 +599,37 @@ fn get_prop_name<'a>(rt: &mut RuntimeHandle<'a>, value: &str) -> PropName<'stati
     new_prop
 }
 
+fn get_color<'a>(rt: &mut RuntimeHandle<'a>, value: [u8; 4]) -> JsiValue<'static> {
+    let mut rt = unsafe { RuntimeHandle::new_unchecked(rt.get_inner_mut().get_unchecked_mut()) };
+
+    let color_cache = unsafe { &mut *COLOR_CACHE.as_mut_ptr() };
+    if let Some(cached_prop) = color_cache.get(&value) {
+        return (*cached_prop).clone(&mut rt);
+    }
+
+    let color_arr = unsafe { &mut *F32_CONSTRUCTOR.as_mut_ptr() }
+        .call_as_constructor(vec![JsiValue::new_number(4.0)], &mut rt);
+
+    if let Ok(color_arr) = color_arr {
+        let mut obj =
+            JsiObject::from_value(&color_arr, &mut rt).unwrap_or_else(|| JsiObject::new(&mut rt));
+
+        for (i, val) in value.iter().enumerate() {
+            obj.set(
+                get_prop_name(&mut rt, &i.to_string()),
+                &JsiValue::new_number((*val as f64) / 255.0),
+                &mut rt,
+            );
+        }
+
+        color_cache.insert(value, color_arr.clone(&mut rt));
+
+        return color_arr;
+    } else {
+        return JsiValue::new_null();
+    }
+}
+
 fn get_font_style(rt: &mut RuntimeHandle<'static>, style: &FontStyle) -> JsiValue<'static> {
     let font_style_cache = unsafe { &mut *FONT_STYLE_CACHE.as_mut_ptr() };
     if let Some(cached_style) = font_style_cache.get(style) {
@@ -517,33 +658,99 @@ fn get_font_style(rt: &mut RuntimeHandle<'static>, style: &FontStyle) -> JsiValu
     new_value
 }
 
-fn get_or_create_font_families(
+fn get_font_families(
     rt: &mut RuntimeHandle<'static>,
-    families: &str,
+    families: &Vec<Cow<'static, str>>,
 ) -> JsiValue<'static> {
-    let font_families_cache = unsafe { &mut *STRING_CACHE.as_mut_ptr() };
+    let font_families_cache = unsafe { &mut *FONT_FAMILIES_CACHE.as_mut_ptr() };
     if let Some(cached_value) = font_families_cache.get(families) {
         return (*cached_value).clone(rt);
     }
 
-    let mut arr = JsiArray::new(1, rt);
-    arr.set(0, &JsiValue::new_string(families, rt), rt);
-    let new_value = arr.as_value(rt);
-    font_families_cache.insert(families.to_string(), new_value.clone(rt));
-    new_value
+    let value = JsiArray::new(families.len(), rt).as_value(rt);
+    let mut obj = JsiObject::from_value(&value, rt).unwrap_or_else(|| JsiObject::new(rt));
+
+    for (i, family) in families.iter().enumerate() {
+        // arr.set(i, &get_string(rt, family), rt);
+        obj.set(
+            get_prop_name(rt, &i.to_string()),
+            &get_string(rt, family),
+            rt,
+        );
+    }
+
+    font_families_cache.insert(families.to_vec(), value.clone(rt));
+    value
 }
+
+fn get_style(
+    rt: &mut RuntimeHandle<'static>,
+    style: &TextStyle,
+    opts: &MarkdownOptions,
+) -> JsiValue<'static> {
+    let style_cache = unsafe { &mut *STYLE_CACHE.as_mut_ptr() };
+
+    // Check if the segment is already in the cache
+    if let Some(cached_value) = style_cache.get(style) {
+        return cached_value.clone(rt);
+    }
+
+    let mut obj = JsiObject::new(rt);
+
+    if let Some(font_size) = style.font_size {
+        obj.set(
+            get_prop_name(rt, "fontSize"),
+            &JsiValue::new_number(*font_size),
+            rt,
+        );
+    }
+
+    if let Some(font_style) = &style.font_style {
+        obj.set(
+            get_prop_name(rt, "fontStyle"),
+            &get_font_style(rt, font_style),
+            rt,
+        );
+    }
+
+    if let Some(decoration) = &style.decoration {
+        obj.set(
+            get_prop_name(rt, "decoration"),
+            &JsiValue::new_number(*decoration as i32 as f64),
+            rt,
+        );
+    }
+
+    if let Some(font_families) = &style.font_families {
+        obj.set(
+            get_prop_name(rt, "fontFamilies"),
+            &get_font_families(rt, font_families),
+            rt,
+        );
+    }
+
+    if let Some(color) = &style.color {
+        obj.set(get_prop_name(rt, "color"), &get_color(rt, *color), rt);
+    }
+
+    if opts.height_multiplier != 1.0 {
+        obj.set(
+            get_prop_name(rt, "heightMultiplier"),
+            &JsiValue::new_number(opts.height_multiplier),
+            rt,
+        );
+    }
+
+    style_cache.insert(style.clone(), obj.as_value(rt));
+
+    obj.as_value(rt)
+}
+
 fn textsegment_to_jsi_value(
     rt: &mut RuntimeHandle<'static>,
     segment: &TextSegment,
     opts: &MarkdownOptions,
 ) -> JsiValue<'static> {
-    let segment_cache = unsafe { &mut *SEGMENT_CACHE.as_mut_ptr() };
-
-    // Check if the segment is already in the cache
-    if let Some(cached_value) = segment_cache.get(segment) {
-        return cached_value.clone(rt);
-    }
-
     // Create a new JsiObject for the segment
     let mut object = JsiObject::new(rt);
 
@@ -553,54 +760,17 @@ fn textsegment_to_jsi_value(
         rt,
     );
 
-    let mut style = JsiObject::new(rt);
-    style.set(
-        get_prop_name(rt, "fontSize"),
-        &JsiValue::new_number(
-            *segment
-                .style
-                .font_size
-                .unwrap_or(unsafe { NotNan::new_unchecked(opts.base_font_size) }),
-        ),
-        rt,
-    );
-
-    if let Some(font_style) = &segment.style.font_style {
-        style.set(
-            get_prop_name(rt, "fontStyle"),
-            &get_font_style(rt, font_style),
-            rt,
-        );
-    }
-
-    if let Some(decoration) = &segment.style.decoration {
-        style.set(
-            get_prop_name(rt, "decoration"),
-            &get_string(rt, decoration),
-            rt,
-        );
-    }
-
-    if let Some(font_families) = &segment.style.font_families {
-        style.set(
-            get_prop_name(rt, "fontFamilies"),
-            &get_or_create_font_families(rt, font_families),
-            rt,
-        );
-    }
-
-    if let Some(color) = &segment.style.color {
-        style.set(get_prop_name(rt, "color"), &get_string(rt, color), rt);
-    }
-
-    object.set(get_prop_name(rt, "style"), &style.as_value(rt), rt);
-
     if let Some(href) = &segment.href {
         object.set(get_prop_name(rt, "href"), &get_string(rt, href), rt);
     }
 
+    object.set(
+        get_prop_name(rt, "style"),
+        &get_style(rt, &segment.style, opts),
+        rt,
+    );
+
     let jsi_value = object.as_value(rt);
-    segment_cache.insert(segment.clone(), jsi_value.clone(rt));
 
     jsi_value
 }

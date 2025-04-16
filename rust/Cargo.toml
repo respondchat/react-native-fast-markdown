@@ -16,6 +16,8 @@ anyhow = { version = "1.0", features = ["backtrace"], default-features = true }
 syntect = "5.0.0"
 ordered-float = "5.0.0"
 linkify = "0.10.0"
+jni = "0.21.1"
+cxx = "1.0.106"
 
 [lib]
 crate-type = ["staticlib"]
